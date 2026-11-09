@@ -9,7 +9,7 @@ from .rms_norm_gated import Qwen3_8RMSNormGated
 
 
 class Qwen3_8LinearAttention(nn.Module):
-    """
+    r"""
     Qwen 3.8 27B 的线性注意力层 (`linear_attn` - Gated DeltaNet，共 48 层)。
     严格对齐 `qwen3.8 27B/config.json` 中的子模块命名与超参数：
     - `linear_num_key_heads = 16`, `linear_key_head_dim = 128` (Q/K 总维度各 2048)

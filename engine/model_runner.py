@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 import torch
 
 from qwen3_8 import (
@@ -7,32 +7,35 @@ from qwen3_8 import (
     Qwen3_8ForCausalLM,
     Qwen3_8HybridCachePool,
 )
+from req_to_state_pool import ReqToStatePool
 from .request import Request
 
 
 class ModelRunner:
     """
     对应 SGLang 中的 `ModelRunner` (位于 Scheduler 进程内，独占管理 GPU 模型权重与物理缓存张量)：
-    1. 持有 `Qwen3_8ForCausalLM` 模型实例与 `Qwen3_8HybridCachePool` 混合显存池。
+    1. 持有 `Qwen3_8ForCausalLM` 模型实例与 `Qwen3_8HybridCachePool` 混合显存池（内部集成双区 `ReqToStatePool`）。
     2. 支持 Chunked Prefill 与 Mixed Batching：将同一批次内的 Decode 请求 (`extend_len=1`)
        与 Prefill 分块请求 (`extend_len=chunk_size`) 统一拍平为一维无 Padding 张量。
     3. 执行模型前向推理 (`forward`) 与 Token 采样 (`sample`)，返回生成的 `next_token_ids`。
     """
 
-    @torch.inference_mode()
     def __init__(
         self,
         config: Qwen3_8Config,
         max_reqs: int,
         max_context_len: int,
         max_total_tokens: int,
+        max_snapshots: int = 16,
         device: str = "cpu",
         dtype: torch.dtype = torch.float32,
+        state_pool: Optional[ReqToStatePool] = None,
     ):
         self.config = config
         self.max_reqs = max_reqs
         self.max_context_len = max_context_len
         self.max_total_tokens = max_total_tokens
+        self.max_snapshots = max_snapshots
         self.device = device
         self.dtype = dtype
 
@@ -44,14 +47,26 @@ class ModelRunner:
             config=config,
             max_reqs=max_reqs,
             max_total_tokens=max_total_tokens,
+            max_snapshots=max_snapshots,
             device=device,
             dtype=dtype,
+            state_pool=state_pool,
         )
+
+    @property
+    def state_pool(self) -> ReqToStatePool:
+        """返回底层 48 层线性注意力的 ReqToStatePool（含活跃工作区与 RadixCache 快照区）。"""
+        return self.cache_pool.state_pool
 
     @torch.inference_mode()
     def reset_req_linear_state(self, req_idx: int) -> None:
-        """清空已完成请求在 48 层 Gated DeltaNet 线性注意力中的循环与卷积状态。"""
+        """清空已完成或新准入请求在 48 层 Gated DeltaNet 线性注意力中的工作区状态。"""
         self.cache_pool.reset_req_linear_state(req_idx)
+
+    @torch.inference_mode()
+    def restore_req_linear_state(self, snapshot_slot: int, req_idx: int) -> None:
+        """将 RadixCache 状态锚点的快照 (`snapshot_slot`) 深拷贝恢复至请求工作区 (`req_idx`)。"""
+        self.cache_pool.restore_req_snapshot(snapshot_slot, req_idx)
 
     @torch.inference_mode()
     def execute_batch(

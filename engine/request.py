@@ -6,7 +6,7 @@ from radix_tree import TreeNode
 class Request:
     """
     Scheduler 内部维护的单个推理请求状态机 (对应 SGLang 的 `Req` 类)。
-    支持 Chunked Prefill (分块预填充) 与 Mixed Batching (Prefill + Decode 混合批处理)。
+    支持混合注意力下的 Chunked Prefill (分块预填充)、Mixed Batching 与状态锚点回退恢复。
     """
 
     def __init__(
@@ -29,10 +29,13 @@ class Request:
 
         # 显存池与 RadixCache 关联状态
         self.req_pool_idx: Optional[int] = None
+        # Softmax KV 命中的前缀长度（这些槽位在准入时已写入 req_to_token 并由 last_locked_node 锁定）
         self.prefix_len_at_start: int = 0
+        # 线性注意力状态锚点长度（拥有有效 linear_state_slot 的最深祖先位置，prefilled_len 从此处开始推进）
+        self.state_anchor_len: int = 0
         self.last_locked_node: Optional[TreeNode] = None
 
-        # Chunked Prefill 进度游标：记录当前 Prompt 已完成计算的 Token 数量
+        # Chunked Prefill 进度游标：记录当前 Prompt 已完成全部层（含线性层与全局层）计算的 Token 数量
         self.prefilled_len: int = 0
         self.is_prefilled: bool = False
 
@@ -64,9 +67,9 @@ class Request:
 
     @property
     def cached_token_count(self) -> int:
-        """当前已在 ReqToTokenPool 中拥有实际 KV 缓存的 Token 数量。"""
+        """当前已在 ReqToTokenPool 中拥有实际 KV 缓存槽位的 Token 数量。"""
         if not self.is_prefilled:
-            return self.prefilled_len
+            return max(self.prefix_len_at_start, self.prefilled_len)
         # Decode 阶段最新采样出的最后一个 output token 尚未经过下一轮前向计算 KV
         return len(self.prompt_ids) + max(0, len(self.output_ids) - 1)
 

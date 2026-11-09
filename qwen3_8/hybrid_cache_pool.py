@@ -1,16 +1,19 @@
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import torch
 
+from req_to_state_pool import ReqToStatePool
 from .config import Qwen3_8Config
 
 
 class Qwen3_8HybridCachePool:
     """
     Qwen 3.8 27B 专用的混合显存池 (Hybrid Cache Pool)：
-    1. 针对 16 层 `full_attention`：
+    1. 针对 16 层 `full_attention` (Softmax Attention)：
        按 SGLang 的 `TokenToKVPool` 管理一维物理槽位缓冲 `[num_full_layers, max_total_tokens, num_kv_heads, head_dim]`。
     2. 针对 48 层 `linear_attention` (Gated DeltaNet)：
-       按请求行 (`req_pool_idx`) 管理因果卷积状态 `conv_state` 与循环状态矩阵 `ssm_state` (float32)。
+       集成双区隔离的 `ReqToStatePool`：
+       - `[0, max_reqs)` 为活跃请求工作区 (`req_pool_idx`)，支持前向传播原地更新；
+       - `[max_reqs, max_reqs + max_snapshots)` 为 `RadixCache` 树节点稀疏状态快照区 (`linear_state_slot`)。
     """
 
     def __init__(
@@ -18,12 +21,15 @@ class Qwen3_8HybridCachePool:
         config: Qwen3_8Config,
         max_reqs: int,
         max_total_tokens: int,
+        max_snapshots: int = 16,
         device: str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
+        state_pool: Optional[ReqToStatePool] = None,
     ):
         self.config = config
         self.max_reqs = max_reqs
         self.max_total_tokens = max_total_tokens
+        self.max_snapshots = max_snapshots
         self.device = device
         self.dtype = dtype
 
@@ -38,7 +44,6 @@ class Qwen3_8HybridCachePool:
         }
 
         num_full_layers = len(self.full_layer_map)
-        num_linear_layers = len(self.linear_layer_map)
 
         # 1. Full Attention 的 TokenToKVPool 物理缓冲区
         self.k_buffer = torch.zeros(
@@ -53,38 +58,28 @@ class Qwen3_8HybridCachePool:
         )
         self.v_buffer = torch.zeros_like(self.k_buffer)
 
-        # 2. Linear Attention (Gated DeltaNet) 的状态缓冲区
-        # QKV 通道总维度: Q(16*128) + K(16*128) + V(48*128) = 2048 + 2048 + 6144 = 10240
-        conv_dim = (
-            2 * config.linear_num_key_heads * config.linear_key_head_dim
-            + config.linear_num_value_heads * config.linear_value_head_dim
-        )
-        self.conv_state = torch.zeros(
-            (
-                num_linear_layers,
-                max_reqs,
-                conv_dim,
-                config.linear_conv_kernel_dim - 1,
-            ),
-            device=device,
-            dtype=dtype,
+        # 2. Linear Attention (Gated DeltaNet) 的双区状态池 ReqToStatePool
+        self.state_pool: ReqToStatePool = (
+            state_pool
+            if state_pool is not None
+            else ReqToStatePool(
+                max_reqs=max_reqs,
+                max_snapshots=max_snapshots,
+                config=config,
+                device=device,
+                dtype=dtype,
+            )
         )
 
-        # SSM / DeltaNet 递归状态根据配置固定使用 float32 (`mamba_ssm_dtype: "float32"`)
-        ssm_dtype = (
-            torch.float32 if config.mamba_ssm_dtype == "float32" else dtype
-        )
-        self.ssm_state = torch.zeros(
-            (
-                num_linear_layers,
-                max_reqs,
-                config.linear_num_value_heads,
-                config.linear_key_head_dim,
-                config.linear_value_head_dim,
-            ),
-            device=device,
-            dtype=ssm_dtype,
-        )
+    @property
+    def conv_state(self) -> torch.Tensor:
+        assert self.state_pool.conv_state is not None
+        return self.state_pool.conv_state
+
+    @property
+    def ssm_state(self) -> torch.Tensor:
+        assert self.state_pool.ssm_state is not None
+        return self.state_pool.ssm_state
 
     def get_full_kv_buffers(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取指定 Full Attention 层的 K/V 物理池张量。"""
@@ -93,11 +88,21 @@ class Qwen3_8HybridCachePool:
 
     def get_linear_states(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """获取指定 Linear Attention 层的 (conv_state, ssm_state) 状态张量。"""
-        pool_idx = self.linear_layer_map[layer_idx]
-        return self.conv_state[pool_idx], self.ssm_state[pool_idx]
+        return self.state_pool.get_layer_states(layer_idx)
 
     @torch.inference_mode()
     def reset_req_linear_state(self, req_idx: int) -> None:
-        """当请求释放或初始化时，清零该请求对应的 Linear Attention 状态。"""
-        self.conv_state[:, req_idx].zero_()
-        self.ssm_state[:, req_idx].zero_()
+        """当请求释放或初始化时，清零该请求对应的工作区 Linear Attention 状态。"""
+        self.state_pool.reset_working_state(req_idx)
+
+    @torch.inference_mode()
+    def capture_req_snapshot(
+        self, req_idx: int, snapshot_slot: int, debug_tag: Optional[str] = None
+    ) -> None:
+        """将请求工作区 `req_idx` 的线性状态保存至树节点快照槽位 `snapshot_slot`。"""
+        self.state_pool.capture_snapshot(req_idx, snapshot_slot, debug_tag=debug_tag)
+
+    @torch.inference_mode()
+    def restore_req_snapshot(self, snapshot_slot: int, req_idx: int) -> None:
+        """将树节点快照槽位 `snapshot_slot` 的线性状态恢复 (Fork) 至请求工作区 `req_idx`。"""
+        self.state_pool.restore_snapshot(snapshot_slot, req_idx)

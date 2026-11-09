@@ -20,12 +20,14 @@ class TokenizerManager:
         max_reqs: int = 8,
         max_context_len: int = 128,
         max_total_tokens: int = 256,
+        max_snapshots: int = 16,
         chunked_prefill_size: int = 4,
     ):
         self.config = config
         self.max_reqs = max_reqs
         self.max_context_len = max_context_len
         self.max_total_tokens = max_total_tokens
+        self.max_snapshots = max_snapshots
         self.chunked_prefill_size = chunked_prefill_size
 
         self.piece_to_id: Dict[str, int] = {}
@@ -62,6 +64,7 @@ class TokenizerManager:
                 "max_reqs": self.max_reqs,
                 "max_context_len": self.max_context_len,
                 "max_total_tokens": self.max_total_tokens,
+                "max_snapshots": self.max_snapshots,
                 "chunked_prefill_size": self.chunked_prefill_size,
             },
             name="SGLang-Scheduler-Process",

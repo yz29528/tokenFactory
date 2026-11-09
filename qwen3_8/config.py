@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import re
 from typing import Any, Dict, List, Optional, Union
 
 
@@ -88,15 +89,67 @@ class Qwen3_8Config:
             i for i, l_type in enumerate(self.layer_types) if l_type == "linear_attention"
         ]
 
+    @staticmethod
+    def _parse_config_text(content: str) -> Dict[str, Any]:
+        """
+        解析配置文件文本：优先按标准 JSON 解析；若文件为 HuggingFace 网页直接复制的无引号/无冒号文本格式，
+        自动截取 `{ ... }` 主体并还原为合法 JSON 字典。
+        """
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+
+        start_idx = content.find("{")
+        end_idx = content.rfind("}")
+        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+            raise ValueError("无法在配置文件中找到有效的 `{ ... }` 结构！")
+
+        body = content[start_idx : end_idx + 1]
+
+        def _format_scalar(val: str) -> str:
+            if val in ("true", "false", "null") or val.startswith(("[", "{", '"')):
+                return val
+            if re.fullmatch(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", val):
+                return val
+            return json.dumps(val)
+
+        fixed_lines: List[str] = []
+        for raw_line in body.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            if stripped in ("{", "}", "{,", "},", "[", "]", "[,", "],"):
+                fixed_lines.append(stripped)
+                continue
+
+            has_comma = stripped.endswith(",")
+            core = stripped[:-1].strip() if has_comma else stripped
+            comma_str = "," if has_comma else ""
+
+            if " " in core:
+                key, rest = core.split(" ", 1)
+                key = key.strip().strip('"')
+                rest = rest.strip()
+                if rest in ("[", "{"):
+                    fixed_lines.append(f'"{key}": {rest}{comma_str}')
+                else:
+                    fixed_lines.append(f'"{key}": {_format_scalar(rest)}{comma_str}')
+            else:
+                fixed_lines.append(f"{_format_scalar(core)}{comma_str}")
+
+        return json.loads("\n".join(fixed_lines))
+
     @classmethod
     def from_json_file(cls, config_path: Union[str, Path]) -> "Qwen3_8Config":
         """
         从 `qwen3.8 27B/config.json` 读取并解析模型配置。
-        自动兼容顶层多模态嵌套结构（提取 `text_config`）或纯文本配置结构。
+        自动兼容顶层多模态嵌套结构（提取 `text_config`）、纯文本配置结构以及 HuggingFace 网页复制格式。
         """
         path = Path(config_path)
-        with path.open("r", encoding="utf-8") as f:
-            raw: Dict[str, Any] = json.load(f)
+        raw: Dict[str, Any] = cls._parse_config_text(
+            path.read_text(encoding="utf-8")
+        )
 
         text_cfg: Dict[str, Any] = raw.get("text_config", raw)
         rope_params: Dict[str, Any] = text_cfg.get("rope_parameters", {})
