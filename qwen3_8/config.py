@@ -61,6 +61,10 @@ class Qwen3_8Config:
     vision_config: Optional[Dict[str, Any]] = None
     quantization_config: Optional[Dict[str, Any]] = None
 
+    # 张量并行 (Tensor Parallelism) 配置
+    tp_size: int = 1
+    tp_rank: int = 0
+
     def __post_init__(self) -> None:
         if not self.layer_types:
             self.layer_types = [

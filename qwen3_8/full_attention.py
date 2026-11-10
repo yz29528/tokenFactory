@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from .config import Qwen3_8Config
 from .forward_batch import ForwardBatch
+from .fp8_linear import ColumnParallelFP8Linear, RowParallelFP8Linear
 from .hybrid_cache_pool import Qwen3_8HybridCachePool
 from .rms_norm import Qwen3_8RMSNorm
 from .rotary_embedding import PartialRotaryEmbedding
@@ -12,58 +13,76 @@ from .rotary_embedding import PartialRotaryEmbedding
 class Qwen3_8FullAttention(nn.Module):
     """
     Qwen 3.8 27B 的标准全局注意力层 (`self_attn`，每 4 层出现 1 次，共 16 层)。
-    核心特性（严格对应 `qwen3.8 27B/config.json`）：
-    1. GQA 架构：`num_attention_heads = 24`, `num_key_value_heads = 4` (6:1 分组查询), `head_dim = 256`
-    2. Q/K RMSNorm：包含独立的 `q_norm` 和 `k_norm` (维度 256)
-    3. Partial RoPE：`partial_rotary_factor = 0.25`，仅对每个 Head 的前 64 维施加旋转编码
-    4. Attention Output Gate (`attn_output_gate = True`, `output_gate_type = "swish"`)：
-       `q_proj` 同时投影出 Query 与 Gate 分支，注意力输出经 `SiLU(gate)` 门控后再进入 `o_proj`
-    5. 对接 SGLang 两级显存池：通过 `out_cache_loc` 写入 `TokenToKVPool`，通过 `req_to_token` 寻址历史 KV
+    采用 Megatron-LM 风格的【先列并行 (Column-Parallel) -> 中间本地 SDPA/門控 (0 通信) -> 后行并行 (Row-Parallel) + 单次 AllReduce】：
+    1. 前段（列并行）：
+       - `q_proj`, `k_proj`, `v_proj` 均采用 `ColumnParallelFP8Linear`，按 Head 维度切分到各 TP Rank。
+    2. 中段（各卡本地独立计算，0 跨卡通信）：
+       - `q_norm`, `k_norm` (每个 Head 内部 256 维归一化)、`Partial RoPE`、本地 KV 池分片读写、SDPA 注意力及 `SiLU(gate)` 门控。
+    3. 后段（行并行 + 1 次 AllReduce）：
+       - `o_proj` 采用 `RowParallelFP8Linear`，沿输入 Head 维切分并在末尾执行单次 `AllReduce`。
     """
 
     def __init__(self, config: Qwen3_8Config, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        self.tp_size = config.tp_size
+        self.tp_rank = config.tp_rank
+
+        assert config.num_attention_heads % self.tp_size == 0, (
+            f"num_attention_heads={config.num_attention_heads} 无法被 tp_size={self.tp_size} 整除！"
+        )
 
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+        self.global_num_heads = config.num_attention_heads
+        self.global_num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.scaling = self.head_dim**-0.5
         self.attn_output_gate = config.attn_output_gate
 
-        # 当启用 attn_output_gate 时，q_proj 输出 2 倍通道（前半为 Q，后半为 Swish Output Gate）
-        q_proj_out_dim = (
-            self.num_heads * self.head_dim * 2
+        # 当前 TP Rank 本地分片头数
+        self.num_heads = self.global_num_heads // self.tp_size
+        if self.global_num_kv_heads >= self.tp_size:
+            assert self.global_num_kv_heads % self.tp_size == 0
+            self.num_kv_heads = self.global_num_kv_heads // self.tp_size
+        else:
+            assert self.tp_size % self.global_num_kv_heads == 0
+            self.num_kv_heads = 1
+
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+        # 1. 前段：列并行 Q, K, V 投影
+        global_q_proj_out_dim = (
+            self.global_num_heads * self.head_dim * 2
             if self.attn_output_gate
-            else self.num_heads * self.head_dim
+            else self.global_num_heads * self.head_dim
         )
-        self.q_proj = nn.Linear(
-            self.hidden_size, q_proj_out_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
+        global_kv_proj_out_dim = self.global_num_kv_heads * self.head_dim
+
+        self.q_proj = ColumnParallelFP8Linear(
+            in_features=self.hidden_size,
+            global_out_features=global_q_proj_out_dim,
             bias=config.attention_bias,
+            config=config,
         )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
+        self.k_proj = ColumnParallelFP8Linear(
+            in_features=self.hidden_size,
+            global_out_features=global_kv_proj_out_dim,
             bias=config.attention_bias,
+            config=config,
+            num_total_heads=self.global_num_kv_heads,
         )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim,
-            self.hidden_size,
+        self.v_proj = ColumnParallelFP8Linear(
+            in_features=self.hidden_size,
+            global_out_features=global_kv_proj_out_dim,
             bias=config.attention_bias,
+            config=config,
+            num_total_heads=self.global_num_kv_heads,
         )
 
-        # Q / K Head-wise RMSNorm (对应 config.json 中的 self_attn.q_norm / k_norm)
+        # 2. 中段：Head-wise Q/K RMSNorm 与 Partial RoPE (每卡保存完整 256 维 norm 权重，0 通信)
         self.q_norm = Qwen3_8RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Qwen3_8RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        # Partial RoPE (rotary_dim = 64, pass_dim = 192)
         self.rotary_emb = PartialRotaryEmbedding(
             head_dim=self.head_dim,
             partial_rotary_factor=config.partial_rotary_factor,
@@ -71,6 +90,24 @@ class Qwen3_8FullAttention(nn.Module):
             mrope_section=config.mrope_section,
             mrope_interleaved=config.mrope_interleaved,
         )
+
+        # 3. 后段：行并行 o_proj + 单次 AllReduce
+        self.o_proj = RowParallelFP8Linear(
+            global_in_features=self.global_num_heads * self.head_dim,
+            out_features=self.hidden_size,
+            bias=config.attention_bias,
+            config=config,
+        )
+
+    @torch.no_grad()
+    def load_tp_from_full_layer(self, full_layer: "Qwen3_8FullAttention") -> None:
+        """从单卡完整 `Qwen3_8FullAttention` 切片加载当前 `tp_rank` 的权重。"""
+        self.q_proj.load_from_full_linear(full_layer.q_proj)
+        self.k_proj.load_from_full_linear(full_layer.k_proj)
+        self.v_proj.load_from_full_linear(full_layer.v_proj)
+        self.o_proj.load_from_full_linear(full_layer.o_proj)
+        self.q_norm.weight.copy_(full_layer.q_norm.weight)
+        self.k_norm.weight.copy_(full_layer.k_norm.weight)
 
     def forward(
         self,
@@ -81,7 +118,7 @@ class Qwen3_8FullAttention(nn.Module):
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
 
-        # 1. Q (含可选 Output Gate)、K、V 线性投影
+        # 1. 列并行投影得到本卡分片的 Q (含 Gate)、K、V (0 通信)
         if self.attn_output_gate:
             qg = self.q_proj(hidden_states).view(
                 num_tokens, self.num_heads, self.head_dim * 2
@@ -101,26 +138,26 @@ class Qwen3_8FullAttention(nn.Module):
             num_tokens, self.num_kv_heads, self.head_dim
         )
 
-        # 2. Q/K RMSNorm + Partial RoPE (仅旋转前 64 维)
+        # 2. 各卡本地 Q/K RMSNorm + Partial RoPE (0 通信)
         q = self.q_norm(q)
         k = self.k_norm(k)
         q, k = self.rotary_emb(q, k, positions)
 
-        # 3. 将新计算的 K, V 写入第二层池 TokenToKVPool 的对应物理槽位 (out_cache_loc)
+        # 3. 写入本卡分片的 TokenToKVPool 物理槽位 (out_cache_loc)
         layer_k_buffer, layer_v_buffer = cache_pool.get_full_kv_buffers(self.layer_idx)
         layer_k_buffer[forward_batch.out_cache_loc] = k
         layer_v_buffer[forward_batch.out_cache_loc] = v
 
-        # 4. 通过第一层池 ReqToTokenPool 收集每个请求的物理槽位并计算 Attention
+        # 4. 本地 Head 分片执行 SDPA 注意力与 Swish 门控 (0 通信)
         attn_output = self._slot_based_attention(
             q, layer_k_buffer, layer_v_buffer, forward_batch
         )
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
 
-        # 5. 应用 Swish/SiLU Output Gate 并执行输出投影
         if gate is not None:
             attn_output = attn_output * F.silu(gate)
 
+        # 5. 行并行 o_proj (内部执行单次 AllReduce)
         return self.o_proj(attn_output)
 
     def _slot_based_attention(
@@ -130,11 +167,6 @@ class Qwen3_8FullAttention(nn.Module):
         layer_v_buffer: torch.Tensor,
         batch: ForwardBatch,
     ) -> torch.Tensor:
-        """
-        基于 SGLang 的二级索引寻址：
-        先从第一层 `batch.req_to_token[req_idx, :seq_len]` 取出物理槽位列表 `kv_slots`，
-        再从第二层 `layer_k_buffer[kv_slots]` 取出实际的 K/V 向量执行 GQA 注意力计算。
-        """
         outputs = []
         token_offset = 0
 
@@ -143,25 +175,20 @@ class Qwen3_8FullAttention(nn.Module):
             ext_len = batch.extend_lens[i]
             seq_len = int(batch.seq_lens[i].item())
 
-            q_i = q[token_offset : token_offset + ext_len]  # [ext_len, num_heads, head_dim]
+            q_i = q[token_offset : token_offset + ext_len]
             token_offset += ext_len
 
-            # 第一层寻址：从 ReqToTokenPool 获取该请求所有历史+当前 token 的物理槽位索引
-            kv_slots = batch.req_to_token[req_idx, :seq_len]  # [seq_len]
-
-            # 第二层寻址：从 TokenToKVPool 聚集出真实的 K, V 张量
-            k_i = layer_k_buffer[kv_slots]  # [seq_len, num_kv_heads, head_dim]
+            kv_slots = batch.req_to_token[req_idx, :seq_len]
+            k_i = layer_k_buffer[kv_slots]
             v_i = layer_v_buffer[kv_slots]
 
-            # GQA 广播: 4 个 KV Head 扩展为 24 个 Head
             k_i = torch.repeat_interleave(k_i, self.num_queries_per_kv, dim=1)
             v_i = torch.repeat_interleave(v_i, self.num_queries_per_kv, dim=1)
 
-            q_sdpa = q_i.transpose(0, 1).unsqueeze(0)  # [1, num_heads, ext_len, head_dim]
-            k_sdpa = k_i.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seq_len, head_dim]
+            q_sdpa = q_i.transpose(0, 1).unsqueeze(0)
+            k_sdpa = k_i.transpose(0, 1).unsqueeze(0)
             v_sdpa = v_i.transpose(0, 1).unsqueeze(0)
 
-            # Prefill / Extend 阶段构造因果掩码 (兼容 RadixCache 命中前缀的情况)
             attn_mask = None
             if ext_len > 1:
                 q_pos = torch.arange(

@@ -41,6 +41,19 @@ class Qwen3_8DecoderLayer(nn.Module):
         )
         self.mlp = Qwen3_8MLP(config)
 
+    @torch.no_grad()
+    def load_tp_from_full_layer(self, full_layer: "Qwen3_8DecoderLayer") -> None:
+        """从单卡完整 `Qwen3_8DecoderLayer` 切片加载当前 `tp_rank` 的权重。"""
+        self.input_layernorm.weight.copy_(full_layer.input_layernorm.weight)
+        self.post_attention_layernorm.weight.copy_(
+            full_layer.post_attention_layernorm.weight
+        )
+        if self.layer_type == "full_attention":
+            self.self_attn.load_tp_from_full_layer(full_layer.self_attn)
+        else:
+            self.linear_attn.load_tp_from_full_layer(full_layer.linear_attn)
+        self.mlp.load_tp_from_full_mlp(full_layer.mlp)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
