@@ -40,6 +40,7 @@ class Scheduler:
         max_snapshots: int = 16,
         chunked_prefill_size: int = 4,
         device: str = "cpu",
+        enable_mtp: bool = False,
     ):
         self.config = config
         self.max_reqs = max_reqs
@@ -47,11 +48,15 @@ class Scheduler:
         self.max_total_tokens = max_total_tokens
         self.max_snapshots = max_snapshots
         self.chunked_prefill_size = chunked_prefill_size
+        self.min_prefill_budget = 1
         self.device = device
+        self.enable_mtp = enable_mtp
 
         # 初始化第一层映射池与 Softmax KV 物理池
         self.req_to_token_pool = ReqToTokenPool(max_reqs, max_context_len)
-        self.token_to_kv_pool = TokenToKVPool(max_total_tokens)
+        self.token_to_kv_pool = TokenToKVPool(
+            max_total_tokens, allocate_mock_buffers=False
+        )
 
         # 初始化底层算子执行器 ModelRunner（内含绑定了真实张量的 ReqToStatePool）
         dtype = torch.bfloat16 if device == "cuda" else torch.float32
@@ -63,6 +68,7 @@ class Scheduler:
             max_snapshots=max_snapshots,
             device=device,
             dtype=dtype,
+            enable_mtp=enable_mtp,
         )
         self.req_to_state_pool: ReqToStatePool = self.model_runner.state_pool
 
@@ -71,6 +77,7 @@ class Scheduler:
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_state_pool=self.req_to_state_pool,
+            on_kv_free=self.model_runner.free_mtp_slots,
         )
 
         # 三个状态队列：
@@ -81,12 +88,15 @@ class Scheduler:
         self.inflight_prefill_queue: List[Request] = []
         self.running_batch: List[Request] = []
         self.step_counter: int = 0
+        self._pending_vocab_updates: dict[int, str] = {}
 
     def _alloc_kv_slots(self, num_tokens: int) -> Optional[List[int]]:
         """申请物理 Softmax KV 槽位；若不足则触发 RadixCache LRU 驱逐（含同步清理被驱逐叶子的线性快照）。"""
         if self.token_to_kv_pool.available_size() < num_tokens:
             need = num_tokens - self.token_to_kv_pool.available_size()
-            self.radix_cache.evict(need)
+            evicted = self.radix_cache.evict(need)
+            if evicted:
+                self.model_runner.free_mtp_slots(evicted)
         return self.token_to_kv_pool.alloc(num_tokens)
 
     def recv_requests(self, in_queue: mp.Queue) -> bool:
@@ -101,33 +111,78 @@ class Scheduler:
                 return False
 
             if isinstance(msg, TokenizedReqInput):
+                if msg.vocab_updates:
+                    self._pending_vocab_updates.update(msg.vocab_updates)
+                if not msg.prompt_ids:
+                    continue
+                prompt_ids = msg.prompt_ids
+                if len(prompt_ids) >= self.max_context_len:
+                    prompt_ids = prompt_ids[: self.max_context_len - 1]
+                max_allowed_new = max(1, self.max_context_len - len(prompt_ids))
+                clamped_new_tokens = max(1, min(msg.max_new_tokens, max_allowed_new))
                 req = Request(
                     req_id=msg.req_id,
                     prompt_text=msg.prompt_text,
-                    prompt_ids=msg.prompt_ids,
-                    max_new_tokens=msg.max_new_tokens,
-                    eos_token_id=msg.eos_token_id or self.config.eos_token_id,
+                    prompt_ids=prompt_ids,
+                    max_new_tokens=clamped_new_tokens,
+                    eos_token_id=(
+                        msg.eos_token_id
+                        if msg.eos_token_id is not None
+                        else self.config.eos_token_id
+                    ),
                     temperature=msg.temperature,
                 )
                 self.waiting_queue.append(req)
         return True
 
-    def _admit_waiting_requests(self) -> None:
+    def _estimate_inflight_demands(self, budget_limit: int) -> tuple[int, int]:
+        """评估当前已在 `inflight_prefill_queue` 中的请求在本步需要消耗的 Token 预算与新 KV 槽位数。"""
+        used_budget = 0
+        used_kv = 0
+        rem = budget_limit
+        for req in self.inflight_prefill_queue:
+            if rem <= 0:
+                break
+            chunk_len = min(req.remaining_prefill_len, rem)
+            start_pos = req.prefilled_len
+            if start_pos < req.prefix_len_at_start < start_pos + chunk_len:
+                chunk_len = req.prefix_len_at_start - start_pos
+            end_pos = start_pos + chunk_len
+            alloc_start = max(start_pos, req.prefix_len_at_start)
+            need_new_kv = max(0, end_pos - alloc_start)
+            used_budget += chunk_len
+            used_kv += need_new_kv
+            rem -= chunk_len
+        return used_budget, used_kv
+
+    def _estimate_inflight_budget_demand(self, budget_limit: int) -> int:
+        """评估当前已在 `inflight_prefill_queue` 中的请求在本步需要消耗的 Token 预算。"""
+        used_budget, _ = self._estimate_inflight_demands(budget_limit)
+        return used_budget
+
+    def _admit_waiting_requests(
+        self,
+        budget_limit: Optional[int] = None,
+        reserved_kv: int = 0,
+    ) -> None:
         """
-        将 `waiting_queue` 中的新请求准入到 `inflight_prefill_queue`：
-        1. 使用 `match_prefix_hybrid(req.prompt_ids[:-1])` 查找最长可复用 Softmax KV 前缀及最深有效线性状态锚点（预留至少最后 1 个 Prompt Token 用于前向产出采样 Logits）。
-        2. 锁定 `last_kv_node` 防止整条路径上的 KV 槽位被驱逐，并将 `matched_kv_slots` 写入 `ReqToTokenPool`。
-        3. 若存在有效 `linear_state_slot`，将其从快照区深拷贝 (Fork) 到请求工作区 `req_idx`；否则清零工作区。
-        4. 将 `req.prefilled_len` 设为 `state_anchor_len`（确保 48 层线性注意力与 16 层全局注意力状态严格对齐）。
+        将 `waiting_queue` 中的新请求按当前剩余 Token 预算与可用 KV 槽位准入到 `inflight_prefill_queue`：
+        1. 评估当前剩余预算 `budget_limit` 及扣除在途请求需求后的可用物理 KV 槽位，避免过度准入锁死请求槽位或树节点。
+        2. 使用 `match_prefix_hybrid(req.prompt_ids[:-1])` 查找最长可复用 Softmax KV 前缀及最深有效线性状态锚点（预留至少最后 1 个 Prompt Token 用于前向产出采样 Logits）。
+        3. 锁定 `last_kv_node` 防止整条路径上的 KV 槽位被驱逐，并将 `matched_kv_slots` 写入 `ReqToTokenPool`。
+        4. 若存在有效 `linear_state_slot`，将其从快照区深拷贝 (Fork) 到请求工作区 `req_idx`；否则清零工作区。
+        5. 将 `req.prefilled_len` 设为 `state_anchor_len`（确保 48 层线性注意力与 16 层全局注意力状态严格对齐）。
         """
         remaining: List[Request] = []
+        avail_budget = budget_limit
+        reserved_new_kv = reserved_kv
         for req in self.waiting_queue:
+            if avail_budget is not None and avail_budget <= 0:
+                remaining.append(req)
+                continue
             if not self.req_to_token_pool.free_req_slots:
                 remaining.append(req)
                 continue
-
-            req_idx = self.req_to_token_pool.alloc_req()
-            assert req_idx is not None
 
             # 仅对前 len(prompt_ids) - 1 个 token 做前缀匹配，确保至少保留最后 1 个 token 参与前向计算并产出首个采样 token
             searchable_prefix = req.prompt_ids[:-1] if len(req.prompt_ids) > 1 else []
@@ -136,6 +191,34 @@ class Scheduler:
             kv_prefix_len = len(match_res.matched_kv_slots)
             state_anchor_len = match_res.state_anchor_len
             self.radix_cache.inc_lock_ref(match_res.last_kv_node)
+
+            if avail_budget is not None:
+                rem_prefill = len(req.prompt_ids) - state_anchor_len
+                planned_chunk = min(rem_prefill, avail_budget)
+                if (
+                    state_anchor_len
+                    < kv_prefix_len
+                    < state_anchor_len + planned_chunk
+                ):
+                    planned_chunk = kv_prefix_len - state_anchor_len
+                end_pos = state_anchor_len + planned_chunk
+                alloc_start = max(state_anchor_len, kv_prefix_len)
+                need_new_kv = max(0, end_pos - alloc_start)
+
+                max_avail_kv = (
+                    self.token_to_kv_pool.available_size()
+                    + self.radix_cache.evictable_size_
+                    - reserved_new_kv
+                )
+                if need_new_kv > max_avail_kv:
+                    self.radix_cache.dec_lock_ref(match_res.last_kv_node)
+                    remaining.append(req)
+                    continue
+                avail_budget -= planned_chunk
+                reserved_new_kv += need_new_kv
+
+            req_idx = self.req_to_token_pool.alloc_req()
+            assert req_idx is not None
 
             if kv_prefix_len > 0:
                 self.req_to_token_pool.write(req_idx, 0, match_res.matched_kv_slots)
@@ -171,61 +254,155 @@ class Scheduler:
         has_prefill = False
 
         # 1. 优先接纳所有正在 Decode 的请求（每个仅占 1 个 Token 预算）
-        for req in self.running_batch:
+        preempted_this_step = False
+        idx = 0
+        while idx < len(self.running_batch):
+            req = self.running_batch[idx]
             assert req.req_pool_idx is not None
-            new_slot = self._alloc_kv_slots(1)
+            can_verify_mtp = (
+                self.enable_mtp
+                and req.pending_draft_token is not None
+                and req.seq_len + 1 <= self.max_context_len
+                and len(req.output_ids) + 1 < req.max_new_tokens
+            )
+            new_slot = self._alloc_kv_slots(2) if can_verify_mtp else None
+            if can_verify_mtp and new_slot is None:
+                can_verify_mtp = False
+                req.pending_draft_token = None
+
+            if not can_verify_mtp:
+                new_slot = self._alloc_kv_slots(1)
+
+            while new_slot is None:
+                if self.inflight_prefill_queue:
+                    victim = self.inflight_prefill_queue.pop()
+                    self._preempt_request(victim)
+                    preempted_this_step = True
+                    new_slot = self._alloc_kv_slots(1)
+                elif len(self.running_batch) - 1 > idx or (
+                    len(self.running_batch) - 1 == idx and active_batch
+                ):
+                    victim = self.running_batch.pop()
+                    self._preempt_request(victim)
+                    preempted_this_step = True
+                    if victim is req:
+                        break
+                    new_slot = self._alloc_kv_slots(1)
+                else:
+                    break
+
             if new_slot is None:
+                if req not in self.running_batch:
+                    continue
                 raise RuntimeError("KV Cache 物理池耗尽，无法为 Decode 请求分配槽位！")
 
             start_pos = req.seq_len - 1
             self.req_to_token_pool.write(req.req_pool_idx, start_pos, new_slot)
 
-            req.cur_chunk_tokens = [req.output_ids[-1]]
-            req.cur_start_pos = start_pos
-            req.cur_seq_len = req.seq_len
-            req.out_cache_loc = new_slot
+            if can_verify_mtp:
+                assert req.pending_draft_token is not None
+                req.cur_chunk_tokens = [req.output_ids[-1], req.pending_draft_token]
+                req.cur_start_pos = start_pos
+                req.cur_seq_len = req.seq_len + 1
+                req.out_cache_loc = new_slot
+                req.cur_is_mtp_verify = True
+            else:
+                req.cur_chunk_tokens = [req.output_ids[-1]]
+                req.cur_start_pos = start_pos
+                req.cur_seq_len = req.seq_len
+                req.out_cache_loc = new_slot
+                req.cur_is_mtp_verify = False
             active_batch.append(req)
             has_decode = True
+            idx += 1
 
-        # 2. 尝试将 waiting_queue 中的新请求准入到 inflight_prefill_queue
-        if self.waiting_queue:
-            self._admit_waiting_requests()
+        if not preempted_this_step:
+            remaining_budget = self.chunked_prefill_size - len(active_batch)
+            if remaining_budget <= 0 and (
+                self.inflight_prefill_queue or self.waiting_queue
+            ):
+                remaining_budget = self.min_prefill_budget
 
-        # 3. 利用剩余 Token 预算对 inflight_prefill_queue 执行分块预填充 (Chunked Prefill)
-        remaining_budget = self.chunked_prefill_size - len(active_batch)
-        for req in list(self.inflight_prefill_queue):
-            if remaining_budget <= 0:
-                break
+            # 2. 尝试将 waiting_queue 中的新请求按剩余可用预算准入到 inflight_prefill_queue
+            if self.waiting_queue:
+                inflight_demand, inflight_kv = self._estimate_inflight_demands(
+                    remaining_budget
+                )
+                admit_budget = max(0, remaining_budget - inflight_demand)
+                if admit_budget > 0:
+                    self._admit_waiting_requests(
+                        budget_limit=admit_budget,
+                        reserved_kv=inflight_kv,
+                    )
 
-            assert req.req_pool_idx is not None
-            chunk_len = min(req.remaining_prefill_len, remaining_budget)
-            start_pos = req.prefilled_len
-            # 若当前处于 [state_anchor_len, prefix_len_at_start) 的线性状态追赶区间，
-            # 在到达分支节点边界 prefix_len_at_start 处对齐切块，以便在该树节点上完成线性状态快照自愈！
-            if start_pos < req.prefix_len_at_start < start_pos + chunk_len:
-                chunk_len = req.prefix_len_at_start - start_pos
-            end_pos = start_pos + chunk_len
-
-            # 仅对尚未拥有树上 KV 槽位的后缀部分申请新物理槽位
-            alloc_start = max(start_pos, req.prefix_len_at_start)
-            need_new_kv = max(0, end_pos - alloc_start)
-            if need_new_kv > 0:
-                new_slots = self._alloc_kv_slots(need_new_kv)
-                if new_slots is None:
+            # 3. 利用剩余 Token 预算对 inflight_prefill_queue 执行分块预填充 (Chunked Prefill)
+            for req in list(self.inflight_prefill_queue):
+                if remaining_budget <= 0:
                     break
-                self.req_to_token_pool.write(req.req_pool_idx, alloc_start, new_slots)
+                if req not in self.inflight_prefill_queue:
+                    continue
 
-            req.cur_chunk_tokens = req.prompt_ids[start_pos:end_pos]
-            req.cur_start_pos = start_pos
-            req.cur_seq_len = end_pos
-            req.out_cache_loc = self.req_to_token_pool.get_req_slots(
-                req.req_pool_idx, end_pos
-            )[start_pos:end_pos]
-            req.prefilled_len = end_pos
+                assert req.req_pool_idx is not None
+                chunk_len = min(req.remaining_prefill_len, remaining_budget)
+                start_pos = req.prefilled_len
+                # 若当前处于 [state_anchor_len, prefix_len_at_start) 的线性状态追赶区间，
+                # 在到达分支节点边界 prefix_len_at_start 处对齐切块，以便在该树节点上完成线性状态快照自愈！
+                if start_pos < req.prefix_len_at_start < start_pos + chunk_len:
+                    chunk_len = req.prefix_len_at_start - start_pos
+                end_pos = start_pos + chunk_len
 
-            active_batch.append(req)
-            remaining_budget -= chunk_len
-            has_prefill = True
+                # 仅对尚未拥有树上 KV 槽位的后缀部分申请新物理槽位
+                alloc_start = max(start_pos, req.prefix_len_at_start)
+                need_new_kv = max(0, end_pos - alloc_start)
+                if need_new_kv > 0:
+                    max_avail_kv = (
+                        self.token_to_kv_pool.available_size()
+                        + self.radix_cache.evictable_size_
+                    )
+                    if max_avail_kv == 0 and not active_batch:
+                        # 当多个 inflight_prefill 请求互相持有 KV 导致无槽位推进时，从队尾抢占低优先级请求解除活锁
+                        while (
+                            self.token_to_kv_pool.available_size()
+                            + self.radix_cache.evictable_size_
+                            == 0
+                            and len(self.inflight_prefill_queue) > 1
+                        ):
+                            victim = self.inflight_prefill_queue.pop()
+                            if victim is req:
+                                self.inflight_prefill_queue.append(victim)
+                                break
+                            self._preempt_request(victim)
+                        max_avail_kv = (
+                            self.token_to_kv_pool.available_size()
+                            + self.radix_cache.evictable_size_
+                        )
+                        if max_avail_kv == 0:
+                            raise RuntimeError(
+                                "KV Cache 物理池容量不足，单个 Prefill 请求无法推进！"
+                            )
+
+                    if 0 < max_avail_kv < need_new_kv:
+                        need_new_kv = max_avail_kv
+                        end_pos = alloc_start + need_new_kv
+                        chunk_len = end_pos - start_pos
+
+                    new_slots = self._alloc_kv_slots(need_new_kv)
+                    if new_slots is None:
+                        break
+                    self.req_to_token_pool.write(req.req_pool_idx, alloc_start, new_slots)
+
+                req.cur_chunk_tokens = req.prompt_ids[start_pos:end_pos]
+                req.cur_start_pos = start_pos
+                req.cur_seq_len = end_pos
+                req.out_cache_loc = self.req_to_token_pool.get_req_slots(
+                    req.req_pool_idx, end_pos
+                )[start_pos:end_pos]
+                req.cur_is_mtp_verify = False
+                req.prefilled_len = end_pos
+
+                active_batch.append(req)
+                remaining_budget -= chunk_len
+                has_prefill = True
 
         if has_prefill and has_decode:
             batch_mode = "MIXED"
@@ -247,14 +424,32 @@ class Scheduler:
         self.step_counter += 1
 
         # 调用 ModelRunner 一次性执行混合批次的前向计算与采样
-        sampled_token_ids = self.model_runner.execute_batch(
-            batch_reqs=active_batch,
-            req_to_token_table=self.req_to_token_pool.req_to_token,
+        if self.enable_mtp:
+            accepted_batches = self.model_runner.execute_batch_speculative(
+                batch_reqs=active_batch,
+                req_to_token_table=self.req_to_token_pool.req_to_token,
+                dirty_from=self.req_to_token_pool.dirty_from,
+                token_to_kv_pool=self.token_to_kv_pool,
+                req_to_token_pool=self.req_to_token_pool,
+            )
+        else:
+            sampled_token_ids = self.model_runner.execute_batch(
+                batch_reqs=active_batch,
+                req_to_token_table=self.req_to_token_pool.req_to_token,
+                dirty_from=self.req_to_token_pool.dirty_from,
+            )
+            accepted_batches = [[tok] for tok in sampled_token_ids]
+
+        out_msg = BatchTokenIDOut(
+            step_id=self.step_counter,
+            batch_mode=batch_mode,
+            multi_token_ids=[] if self.enable_mtp else None,
         )
+        if self._pending_vocab_updates:
+            out_msg.vocab_updates = dict(self._pending_vocab_updates)
+            self._pending_vocab_updates.clear()
 
-        out_msg = BatchTokenIDOut(step_id=self.step_counter, batch_mode=batch_mode)
-
-        for req, next_tok in zip(active_batch, sampled_token_ids):
+        for req, accepted_toks in zip(active_batch, accepted_batches):
             out_msg.req_ids.append(req.req_id)
             out_msg.cached_prefix_lens.append(req.state_anchor_len)
 
@@ -264,13 +459,17 @@ class Scheduler:
                 # 当已算完的进度达到或超过初始 KV 锁定长度时，将新算出的 KV 与当前节点线性状态快照挂入树中
                 # （若到达分裂出的公共前缀分支点 req.prefilled_len == req.prefix_len_at_start，自动触发该分支节点的状态自愈！）
                 if req.prefilled_len >= req.prefix_len_at_start:
+                    should_capture = req.is_prefill_complete or (
+                        req.prefilled_len == req.prefix_len_at_start
+                        and req.last_locked_node.linear_state_slot is None
+                    )
                     new_prefix_len, new_locked_node = (
                         self.radix_cache.cache_unfinished_req(
                             req_idx=req.req_pool_idx,
                             token_ids=req.prompt_ids[: req.prefilled_len],
                             prefix_len_at_start=req.prefix_len_at_start,
                             last_locked_node=req.last_locked_node,
-                            capture_linear_state=True,
+                            capture_linear_state=should_capture,
                         )
                     )
                     req.prefix_len_at_start = new_prefix_len
@@ -282,15 +481,20 @@ class Scheduler:
                 if not req.is_prefill_complete:
                     # 尚有剩余 Prompt Chunk 未算完：不产出新 Token，继续留在 inflight_prefill_queue
                     out_msg.new_token_ids.append(None)
+                    if out_msg.multi_token_ids is not None:
+                        out_msg.multi_token_ids.append([])
                     out_msg.finished_flags.append(False)
                     continue
 
                 # 最后一个 Prefill Chunk 已完成！采出首个生成 Token，并从 inflight_prefill_queue 移出
+                next_tok = accepted_toks[0]
                 req.is_prefilled = True
                 if req in self.inflight_prefill_queue:
                     self.inflight_prefill_queue.remove(req)
                 req.output_ids.append(next_tok)
                 out_msg.new_token_ids.append(next_tok)
+                if out_msg.multi_token_ids is not None:
+                    out_msg.multi_token_ids.append([next_tok])
 
                 finished = req.is_finished()
                 out_msg.finished_flags.append(finished)
@@ -299,12 +503,30 @@ class Scheduler:
                 else:
                     self.running_batch.append(req)
             else:
-                # 当前请求处于 Decode 阶段
-                req.output_ids.append(next_tok)
+                # 当前请求处于 Decode 阶段（若 MTP 验证命中，单步可追加 2 个 Token）
+                emitted_toks: List[int] = []
+                for idx_tok, tok in enumerate(accepted_toks):
+                    req.output_ids.append(tok)
+                    emitted_toks.append(tok)
+                    if req.is_finished():
+                        if idx_tok == 0 and len(accepted_toks) == 2:
+                            # 首个 Token 即触发停止（如 EOS），释放第 2 个多余槽位防止泄漏
+                            self.token_to_kv_pool.free([req.out_cache_loc[1]])
+                            assert req.req_pool_idx is not None
+                            self.req_to_token_pool.write(
+                                req.req_pool_idx, req.cur_start_pos + 1, [-1]
+                            )
+                            self.model_runner.invalidate_req_synced_len(
+                                req.req_pool_idx, req.cur_start_pos + 1
+                            )
+                        break
+
                 out_msg.chunk_progress.append(
                     f"decode {len(req.output_ids)}/{req.max_new_tokens}"
                 )
-                out_msg.new_token_ids.append(next_tok)
+                out_msg.new_token_ids.append(emitted_toks[-1])
+                if out_msg.multi_token_ids is not None:
+                    out_msg.multi_token_ids.append(emitted_toks)
 
                 finished = req.is_finished()
                 out_msg.finished_flags.append(finished)
@@ -314,6 +536,54 @@ class Scheduler:
                     self._retire_request(req)
 
         return out_msg
+
+    def _preempt_request(self, req: Request) -> None:
+        """
+        抢占一个正在运行或处于 Chunked Prefill 中的请求并回退至 `waiting_queue` 头部：
+        1. 释放尚未入树的私有 KV 槽位、解锁 RadixCache 节点并归还 `ReqToTokenPool` 行。
+        2. 清零 `ReqToStatePool` 中的活跃线性状态工作区。
+        3. 若请求已处于 Decode 阶段并产出部分 Token，将其合并回 `prompt_ids` 并扣减 `max_new_tokens`，
+           使后续重新准入时无需重复生成已产出的 Token 且可继续复用 RadixCache 前缀。
+        """
+        if req.req_pool_idx is not None and req.last_locked_node is not None:
+            req_idx = req.req_pool_idx
+            if req.cached_token_count > req.prefix_len_at_start:
+                uninserted = [
+                    s
+                    for s in self.req_to_token_pool.get_req_slots(
+                        req_idx, req.cached_token_count
+                    )[req.prefix_len_at_start : req.cached_token_count]
+                    if s >= 0
+                ]
+                if uninserted:
+                    self.model_runner.free_mtp_slots(uninserted)
+            self.radix_cache.abort_req(
+                req_idx=req_idx,
+                allocated_seq_len=req.cached_token_count,
+                prefix_len_at_start=req.prefix_len_at_start,
+                last_locked_node=req.last_locked_node,
+            )
+            self.model_runner.reset_req_linear_state(req_idx)
+
+        if req.is_prefilled and req.output_ids:
+            req.max_new_tokens = max(1, req.max_new_tokens - len(req.output_ids))
+            req.prompt_ids.extend(req.output_ids)
+            req.output_ids.clear()
+
+        req.req_pool_idx = None
+        req.prefix_len_at_start = 0
+        req.state_anchor_len = 0
+        req.last_locked_node = None
+        req.prefilled_len = 0
+        req.is_prefilled = False
+        req.cur_chunk_tokens = []
+        req.cur_start_pos = 0
+        req.cur_seq_len = 0
+        req.out_cache_loc = []
+        req.pending_draft_token = None
+        req.cur_is_mtp_verify = False
+
+        self.waiting_queue.insert(0, req)
 
     def _retire_request(self, req: Request) -> None:
         """
@@ -369,6 +639,8 @@ class Scheduler:
         max_total_tokens: int = 256,
         max_snapshots: int = 16,
         chunked_prefill_size: int = 4,
+        device: str = "cpu",
+        enable_mtp: bool = False,
     ) -> None:
         """子进程入口函数：启动带混合注意力缓存与 Chunked Prefill 的 Scheduler 事件循环。"""
         scheduler = Scheduler(
@@ -378,6 +650,8 @@ class Scheduler:
             max_total_tokens=max_total_tokens,
             max_snapshots=max_snapshots,
             chunked_prefill_size=chunked_prefill_size,
+            device=device,
+            enable_mtp=enable_mtp,
         )
 
         keep_running = True

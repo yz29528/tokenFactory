@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Dict, Optional, Tuple
 import torch
 
@@ -44,13 +45,14 @@ class Qwen3_8HybridCachePool:
         }
 
         num_full_layers = len(self.full_layer_map)
+        local_num_kv_heads = max(1, config.num_key_value_heads // config.tp_size)
 
-        # 1. Full Attention 的 TokenToKVPool 物理缓冲区
+        # 1. Full Attention 的 TokenToKVPool 物理缓冲区 (按 tp_size 切分本卡 KV Head 数)
         self.k_buffer = torch.zeros(
             (
                 num_full_layers,
                 max_total_tokens,
-                config.num_key_value_heads,
+                local_num_kv_heads,
                 config.head_dim,
             ),
             device=device,
@@ -70,6 +72,26 @@ class Qwen3_8HybridCachePool:
                 dtype=dtype,
             )
         )
+        self._mtp_cache_pool: Optional["Qwen3_8HybridCachePool"] = None
+
+    def get_mtp_cache_pool(self) -> "Qwen3_8HybridCachePool":
+        """获取或懒加载与主缓存池配对的独立 MTP 专用 Qwen3_8HybridCachePool（其 full_layer_map 包含 0..mtp_num_hidden_layers-1）。"""
+        if self._mtp_cache_pool is None:
+            num_mtp_layers = max(1, self.config.mtp_num_hidden_layers)
+            mtp_cfg = replace(
+                self.config,
+                num_hidden_layers=num_mtp_layers,
+                layer_types=["full_attention"] * num_mtp_layers,
+            )
+            self._mtp_cache_pool = Qwen3_8HybridCachePool(
+                config=mtp_cfg,
+                max_reqs=self.max_reqs,
+                max_total_tokens=self.max_total_tokens,
+                max_snapshots=0,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        return self._mtp_cache_pool
 
     @property
     def conv_state(self) -> torch.Tensor:

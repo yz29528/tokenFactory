@@ -167,25 +167,32 @@ class Qwen3_8FullAttention(nn.Module):
         layer_v_buffer: torch.Tensor,
         batch: ForwardBatch,
     ) -> torch.Tensor:
-        outputs = []
-        token_offset = 0
+        """
+        向量化 Paged / Slot-based SDPA 注意力计算：
+        消除逐请求 Python 循环，单次批量从 `layer_k_buffer` / `layer_v_buffer` 收集物理槽位并构造批量因果掩码并行执行。
+        """
+        bsz = batch.batch_size
+        max_seq_len = batch.max_seq_len
+        max_ext_len = batch.max_extend_len
 
-        for i in range(batch.batch_size):
-            req_idx = int(batch.req_pool_indices[i].item())
-            ext_len = batch.extend_lens[i]
-            seq_len = int(batch.seq_lens[i].item())
-
-            q_i = q[token_offset : token_offset + ext_len]
-            token_offset += ext_len
+        # 单请求快速路径（零 Padding）
+        if bsz == 1:
+            req_idx = (
+                batch.req_pool_indices_list[0]
+                if batch.req_pool_indices_list is not None
+                else int(batch.req_pool_indices[0].item())
+            )
+            ext_len = batch.extend_lens[0]
+            seq_len = max_seq_len
 
             kv_slots = batch.req_to_token[req_idx, :seq_len]
             k_i = layer_k_buffer[kv_slots]
             v_i = layer_v_buffer[kv_slots]
+            if self.num_queries_per_kv > 1:
+                k_i = torch.repeat_interleave(k_i, self.num_queries_per_kv, dim=1)
+                v_i = torch.repeat_interleave(v_i, self.num_queries_per_kv, dim=1)
 
-            k_i = torch.repeat_interleave(k_i, self.num_queries_per_kv, dim=1)
-            v_i = torch.repeat_interleave(v_i, self.num_queries_per_kv, dim=1)
-
-            q_sdpa = q_i.transpose(0, 1).unsqueeze(0)
+            q_sdpa = q.transpose(0, 1).unsqueeze(0)
             k_sdpa = k_i.transpose(0, 1).unsqueeze(0)
             v_sdpa = v_i.transpose(0, 1).unsqueeze(0)
 
@@ -203,6 +210,74 @@ class Qwen3_8FullAttention(nn.Module):
             out_i = F.scaled_dot_product_attention(
                 q_sdpa, k_sdpa, v_sdpa, attn_mask=attn_mask, scale=self.scaling
             )
-            outputs.append(out_i.squeeze(0).transpose(0, 1))
+            return out_i.squeeze(0).transpose(0, 1)
 
-        return torch.cat(outputs, dim=0)
+        # 多请求批量收集 KV 槽位: [B, max_seq_len]
+        batch_slots = batch.req_to_token[batch.req_pool_indices, :max_seq_len].clamp(
+            min=0
+        )
+        k_batch = layer_k_buffer[batch_slots]
+        v_batch = layer_v_buffer[batch_slots]
+        if self.num_queries_per_kv > 1:
+            k_batch = torch.repeat_interleave(
+                k_batch, self.num_queries_per_kv, dim=2
+            )
+            v_batch = torch.repeat_interleave(
+                v_batch, self.num_queries_per_kv, dim=2
+            )
+        k_sdpa = k_batch.transpose(1, 2)  # [B, num_heads, max_seq_len, head_dim]
+        v_sdpa = v_batch.transpose(1, 2)  # [B, num_heads, max_seq_len, head_dim]
+
+        # 纯 Decode 批次快速路径 (所有请求 ext_len == 1)
+        if max_ext_len == 1:
+            q_sdpa = q.unsqueeze(2)  # [B, num_heads, 1, head_dim]
+            k_pos = torch.arange(max_seq_len, device=q.device).unsqueeze(0)
+            valid_k = k_pos < batch.seq_lens.unsqueeze(1)
+            attn_mask = torch.zeros(
+                (bsz, 1, 1, max_seq_len), dtype=q.dtype, device=q.device
+            ).masked_fill(~valid_k.unsqueeze(1).unsqueeze(2), float("-inf"))
+            out_sdpa = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa, attn_mask=attn_mask, scale=self.scaling
+            )
+            return out_sdpa.squeeze(2)
+
+        # 变长 Chunked Prefill / Mixed 批次向量化打包路径
+        ext_lens_t = (
+            batch.extend_lens_tensor
+            if batch.extend_lens_tensor is not None
+            else torch.tensor(batch.extend_lens, dtype=torch.long, device=q.device)
+        )
+        b_idx = torch.repeat_interleave(
+            torch.arange(bsz, device=q.device), ext_lens_t
+        )
+        starts = torch.cumsum(ext_lens_t, dim=0) - ext_lens_t
+        t_idx = torch.arange(q.shape[0], device=q.device) - torch.repeat_interleave(
+            starts, ext_lens_t
+        )
+
+        q_padded = torch.zeros(
+            (bsz, max_ext_len, self.num_heads, self.head_dim),
+            dtype=q.dtype,
+            device=q.device,
+        )
+        q_padded[b_idx, t_idx] = q
+        q_sdpa = q_padded.transpose(1, 2)  # [B, num_heads, max_ext_len, head_dim]
+
+        q_rel = torch.arange(max_ext_len, device=q.device).view(1, max_ext_len, 1)
+        q_abs = (batch.seq_lens - ext_lens_t).view(bsz, 1, 1) + q_rel
+        k_pos = torch.arange(max_seq_len, device=q.device).view(1, 1, max_seq_len)
+
+        valid_q = q_rel < ext_lens_t.view(bsz, 1, 1)
+        valid_k = k_pos < batch.seq_lens.view(bsz, 1, 1)
+        causal_cond = (k_pos <= q_abs) & valid_k
+        # 对无效 Padding Query 行开放第 0 列以避免全 -inf 导致 Softmax NaN
+        mask_cond = torch.where(valid_q, causal_cond, k_pos == 0)
+
+        attn_mask = torch.zeros(
+            (bsz, 1, max_ext_len, max_seq_len), dtype=q.dtype, device=q.device
+        ).masked_fill(~mask_cond.unsqueeze(1), float("-inf"))
+
+        out_sdpa = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa, attn_mask=attn_mask, scale=self.scaling
+        )
+        return out_sdpa.transpose(1, 2)[b_idx, t_idx]

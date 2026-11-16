@@ -1,6 +1,6 @@
 from dataclasses import dataclass
-import time
-from typing import Dict, List, Optional, Tuple
+import heapq
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from req_to_state_pool import ReqToStatePool
 from req_to_token_pool import ReqToTokenPool
@@ -14,6 +14,13 @@ class TreeNode:
     2. `linear_state_slot`: 到达该节点末尾时的 48 层 Gated DeltaNet 线性注意力状态快照槽位 (`ReqToStatePool`)。
        由于线性状态快照体积大（单份约 147MB）且不可切片，并非所有节点都保存快照（稀疏快照，无快照时为 `None`）。
     """
+
+    _global_access_tick: int = 0
+
+    @classmethod
+    def next_access_tick(cls) -> int:
+        cls._global_access_tick += 1
+        return cls._global_access_tick
 
     def __init__(
         self,
@@ -34,8 +41,8 @@ class TreeNode:
 
         # 引用计数：当前有多少正在运行的请求锁定了该节点（>0 时其 KV 槽位不可被驱逐）
         self.lock_ref: int = 0
-        # 最近访问时间戳，用于 LRU 驱逐策略
-        self.last_access_time: float = time.monotonic()
+        # 单调递增逻辑访问时钟，用于确定性严格 LRU 驱逐策略（避免 Windows 下 time.monotonic 粒度不足）
+        self.last_access_time: int = TreeNode.next_access_tick()
 
     def __len__(self) -> int:
         return len(self.key)
@@ -74,14 +81,21 @@ class RadixCache:
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool: Optional[TokenToKVPool] = None,
         req_to_state_pool: Optional[ReqToStatePool] = None,
+        on_kv_free: Optional[Callable[[List[int]], None]] = None,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_state_pool = req_to_state_pool
+        self.on_kv_free = on_kv_free
 
         self.root = TreeNode()
         self.root.lock_ref = 1  # 根节点永远不被驱逐
         self.evictable_size_ = 0  # 可驱逐的 Softmax KV token 总数
+        self._stateful_nodes: Set[TreeNode] = set()  # 增量维护当前挂载了 linear_state_slot 的树节点集合
+
+    def evictable_size(self) -> int:
+        """返回当前 RadixCache 中未加锁、可驱逐的 Softmax KV Token 总数。"""
+        return self.evictable_size_
 
     @staticmethod
     def _common_prefix_len(seq1: List[int], seq2: List[int]) -> int:
@@ -127,7 +141,7 @@ class RadixCache:
         1. 查找输入 token 序列 `key` 在 Radix Tree 中的最长 Softmax KV 匹配前缀（必要时分裂边）。
         2. 同时记录匹配路径上拥有有效 `linear_state_slot` 的最深状态锚点 (`state_anchor_node`, `state_anchor_len`)。
         """
-        now = time.monotonic()
+        now = TreeNode.next_access_tick()
         node = self.root
         node.last_access_time = now
 
@@ -142,7 +156,7 @@ class RadixCache:
                 break
 
             child = node.children[first_token]
-            child.last_access_time = now
+            child.last_access_time = TreeNode.next_access_tick()
 
             prefix_len = self._common_prefix_len(child.key, key[idx:])
             if prefix_len < len(child.key):
@@ -186,7 +200,7 @@ class RadixCache:
         if not key:
             return 0
 
-        now = time.monotonic()
+        now = TreeNode.next_access_tick()
         node = self.root
         node.last_access_time = now
         idx = 0
@@ -197,7 +211,7 @@ class RadixCache:
                 break
 
             child = node.children[first_token]
-            child.last_access_time = now
+            child.last_access_time = TreeNode.next_access_tick()
 
             prefix_len = self._common_prefix_len(child.key, key[idx:])
             if prefix_len == len(child.key):
@@ -228,26 +242,33 @@ class RadixCache:
         if num_slots <= 0:
             return []
 
-        stateful_nodes: List[TreeNode] = []
-        stack = list(self.root.children.values())
-        while stack:
-            node = stack.pop()
-            if node.linear_state_slot is not None:
-                stateful_nodes.append(node)
-            stack.extend(node.children.values())
+        stateful_nodes: List[TreeNode] = [
+            n for n in self._stateful_nodes if n.linear_state_slot is not None
+        ]
+        if not stateful_nodes:
+            # 兜底扫描：防止外部直接修改 node.linear_state_slot 未经 attach_node_linear_state 注册
+            stack = list(self.root.children.values())
+            while stack:
+                node = stack.pop()
+                if node.linear_state_slot is not None:
+                    stateful_nodes.append(node)
+                    self._stateful_nodes.add(node)
+                stack.extend(node.children.values())
 
-        # 优先淘汰无锁节点 (lock_ref == 0)，其次按最近访问时间从旧到新 (LRU)
-        stateful_nodes.sort(
-            key=lambda n: (n.lock_ref > 0, n.last_access_time),
+        # 仅淘汰无锁节点 (lock_ref == 0)，按最近访问时间从旧到新 (LRU) 驱逐，保护正在被活跃请求锁定的节点快照
+        evictable_stateful = [n for n in stateful_nodes if n.lock_ref == 0]
+        evictable_stateful.sort(
+            key=lambda n: n.last_access_time,
             reverse=True,
         )
 
         evicted_state_slots: List[int] = []
-        while len(evicted_state_slots) < num_slots and stateful_nodes:
-            victim = stateful_nodes.pop()
+        while len(evicted_state_slots) < num_slots and evictable_stateful:
+            victim = evictable_stateful.pop()
             slot = victim.linear_state_slot
             assert slot is not None
             victim.linear_state_slot = None
+            self._stateful_nodes.discard(victim)
             evicted_state_slots.append(slot)
 
         if self.req_to_state_pool is not None and evicted_state_slots:
@@ -275,13 +296,14 @@ class RadixCache:
             if slot is None:
                 return None
             node.linear_state_slot = slot
+            self._stateful_nodes.add(node)
+            self.req_to_state_pool.capture_snapshot(
+                req_idx=req_idx,
+                snapshot_slot=node.linear_state_slot,
+                debug_tag=debug_tag,
+            )
 
-        self.req_to_state_pool.capture_snapshot(
-            req_idx=req_idx,
-            snapshot_slot=node.linear_state_slot,
-            debug_tag=debug_tag,
-        )
-        node.last_access_time = time.monotonic()
+        node.last_access_time = TreeNode.next_access_tick()
         return node.linear_state_slot
 
     def cache_unfinished_req(
@@ -308,6 +330,8 @@ class RadixCache:
         if already_in_tree_len > prefix_len_at_start:
             duplicate_slots = kv_indices[prefix_len_at_start:already_in_tree_len]
             self.token_to_kv_pool.free(duplicate_slots)
+            if self.on_kv_free is not None and duplicate_slots:
+                self.on_kv_free(duplicate_slots)
 
         # 重新在树上匹配当前前缀，获取树中标准槽位与最新停靠节点
         tree_slots, new_last_node = self.match_prefix(token_ids)
@@ -355,6 +379,8 @@ class RadixCache:
         if already_in_tree_len > prefix_len_at_start:
             duplicate_slots = kv_indices[prefix_len_at_start:already_in_tree_len]
             self.token_to_kv_pool.free(duplicate_slots)
+            if self.on_kv_free is not None and duplicate_slots:
+                self.on_kv_free(duplicate_slots)
 
         if capture_linear_state and self.req_to_state_pool is not None and token_ids:
             _, end_node = self.match_prefix(token_ids)
@@ -389,6 +415,8 @@ class RadixCache:
             ]
             if uninserted_slots:
                 self.token_to_kv_pool.free(uninserted_slots)
+                if self.on_kv_free is not None:
+                    self.on_kv_free(uninserted_slots)
 
         self.dec_lock_ref(last_locked_node)
         self.req_to_token_pool.free_req(req_idx)
@@ -432,10 +460,14 @@ class RadixCache:
         """
         evicted_values: List[int] = []
         leaves = self._collect_evictable_leaves()
-        leaves.sort(key=lambda n: n.last_access_time, reverse=True)
+        # 使用最小堆按 last_access_time 从旧到新维护可驱逐叶子，避免每次弹出后重排全表
+        heap: List[Tuple[float, int, TreeNode]] = [
+            (leaf.last_access_time, id(leaf), leaf) for leaf in leaves
+        ]
+        heapq.heapify(heap)
 
-        while len(evicted_values) < num_tokens and leaves:
-            leaf = leaves.pop()
+        while len(evicted_values) < num_tokens and heap:
+            _, _, leaf = heapq.heappop(heap)
             evicted_values.extend(leaf.value)
             self.evictable_size_ -= len(leaf)
 
@@ -444,13 +476,13 @@ class RadixCache:
                 if self.req_to_state_pool is not None:
                     self.req_to_state_pool.free_snapshot(leaf.linear_state_slot)
                 leaf.linear_state_slot = None
+                self._stateful_nodes.discard(leaf)
 
             parent = leaf.parent
             if parent is not None:
                 del parent.children[leaf.key[0]]
                 if not parent.children and parent != self.root and parent.lock_ref == 0:
-                    leaves.append(parent)
-                    leaves.sort(key=lambda n: n.last_access_time, reverse=True)
+                    heapq.heappush(heap, (parent.last_access_time, id(parent), parent))
 
         if self.token_to_kv_pool is not None and evicted_values:
             self.token_to_kv_pool.free(evicted_values)

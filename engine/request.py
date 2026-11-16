@@ -44,6 +44,9 @@ class Request:
         self.cur_start_pos: int = 0
         self.cur_seq_len: int = 0
         self.out_cache_loc: List[int] = []
+        # MTP 投机解码状态
+        self.pending_draft_token: Optional[int] = None
+        self.cur_is_mtp_verify: bool = False
 
     @property
     def remaining_prefill_len(self) -> int:

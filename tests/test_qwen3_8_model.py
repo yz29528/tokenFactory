@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 from pathlib import Path
 import sys
 import torch
@@ -13,6 +14,66 @@ from qwen3_8 import (
     Qwen3_8ForCausalLM,
     Qwen3_8HybridCachePool,
 )
+
+
+def verify_against_safetensors_index(full_cfg: Qwen3_8Config) -> None:
+    """
+    使用 PyTorch `meta` 设备零显存实例化完整的 64 层 27B `Qwen3_8ForCausalLM(enable_mtp=True)`，
+    将其 `state_dict().keys()` 与 `qwen3.8 27B/model.safetensors.index.json` 中的全部语言模型权重键进行 1:1 严格核对！
+    """
+    index_path = PROJECT_ROOT / "qwen3.8 27B" / "model.safetensors.index.json"
+    with index_path.open("r", encoding="utf-8") as f:
+        index_data = json.load(f)
+
+    weight_map: dict[str, str] = index_data["weight_map"]
+    # 过滤掉多模态视觉编码器 (model.visual.*)，提取全部语言模型、LM Head 与 MTP 权重键
+    expected_keys = {
+        k for k in weight_map.keys() if not k.startswith("model.visual.")
+    }
+
+    with torch.device("meta"):
+        meta_model = Qwen3_8ForCausalLM(full_cfg, enable_mtp=True)
+
+    actual_state = meta_model.state_dict()
+    actual_keys = set(actual_state.keys())
+
+    missing_keys = sorted(expected_keys - actual_keys)
+    unexpected_keys = sorted(actual_keys - expected_keys)
+
+    assert not missing_keys, f"发现缺失的权重键 ({len(missing_keys)} 个): {missing_keys[:10]}"
+    assert not unexpected_keys, (
+        f"发现多余的权重键 ({len(unexpected_keys)} 个): {unexpected_keys[:10]}"
+    )
+
+    # 抽样校验关键张量与 FP8 128x128 块级缩放因子形状
+    assert actual_state["model.language_model.embed_tokens.weight"].shape == (
+        248320,
+        5120,
+    )
+    assert actual_state[
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+    ].shape == (10240, 5120)
+    assert actual_state[
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv"
+    ].shape == (10240 // 128, 5120 // 128)
+    assert actual_state[
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight"
+    ].shape == (6144, 5120)
+    assert actual_state[
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight_scale_inv"
+    ].shape == (6144 // 128, 5120 // 128)
+    assert actual_state[
+        "model.language_model.layers.3.self_attn.q_proj.weight"
+    ].shape == (24 * 256 * 2, 5120)
+    assert actual_state[
+        "model.language_model.layers.3.self_attn.q_proj.weight_scale_inv"
+    ].shape == ((24 * 256 * 2) // 128, 5120 // 128)
+
+    print(
+        f"\n[Safetensors Index 100% 校验通过] "
+        f"共核对 {len(expected_keys)} 个语言模型与 MTP 权重张量键（零缺失、零多余），"
+        f"FP8 128x128 weight_scale_inv 形状完全对齐！"
+    )
 
 
 def main() -> None:
@@ -42,7 +103,10 @@ def main() -> None:
         f"conv_kernel={full_cfg.linear_conv_kernel_dim}, ssm_dtype={full_cfg.mamba_ssm_dtype}"
     )
 
-    # 2. 使用等比例缩小的配置在本地进行快速前向推理验证（保留 3:1 的混合层比例）
+    # 2. 对照 `model.safetensors.index.json` 严格核对完整 64 层 27B 模型的全部参数键名与形状
+    verify_against_safetensors_index(full_cfg)
+
+    # 3. 使用等比例缩小的配置在本地进行快速前向推理验证（保留 3:1 的混合层比例）
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
@@ -93,7 +157,7 @@ def main() -> None:
     )
 
     logits = model(input_ids, positions, cache_pool, prefill_batch)
-    print(f"\n[Prefill 验证成功] 输出 Logits 形状: {logits.shape}")
+    print(f"[Prefill 验证成功] 输出 Logits 形状: {logits.shape}")
 
     # 模拟 1 步 Decode (每个请求各生成 1 个新 token，共 2 个 token)
     decode_ids = torch.argmax(logits, dim=-1)

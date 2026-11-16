@@ -66,6 +66,8 @@ class Qwen3_8ForCausalLM(nn.Module):
             if (enable_mtp and config.mtp_num_hidden_layers > 0)
             else None
         )
+        self._last_hidden_states: Optional[torch.Tensor] = None
+        self._last_token_hidden_states: Optional[torch.Tensor] = None
 
     @property
     def language_model(self) -> Qwen3_8TextModel:
@@ -118,6 +120,7 @@ class Qwen3_8ForCausalLM(nn.Module):
         positions: torch.Tensor,          # [num_tokens] 或 [3, num_tokens] (M-RoPE)
         cache_pool: Qwen3_8HybridCachePool,
         forward_batch: ForwardBatch,
+        return_all_logits: bool = False,
     ) -> torch.Tensor:
         lang_model = self.model.language_model
 
@@ -130,14 +133,64 @@ class Qwen3_8ForCausalLM(nn.Module):
                 hidden_states, positions, cache_pool, forward_batch
             )
 
-        # 3. 仅提取每个请求最后一个 token 的隐状态计算下一个 token 的 Logits
-        last_token_indices = (
-            torch.cumsum(
-                torch.tensor(forward_batch.extend_lens, device=input_ids.device),
-                dim=0,
+        # 3. 提取每个请求最后一个 token 的隐状态（或全部 token 隐状态用于 MTP 验证）计算 Logits
+        ext_lens_t = (
+            forward_batch.extend_lens_tensor
+            if forward_batch.extend_lens_tensor is not None
+            else torch.tensor(
+                forward_batch.extend_lens, dtype=torch.long, device=input_ids.device
             )
-            - 1
         )
-        last_hidden = lang_model.norm(hidden_states[last_token_indices])
+        last_token_indices = torch.cumsum(ext_lens_t, dim=0) - 1
+        self._last_hidden_states = hidden_states
+        self._last_token_hidden_states = hidden_states[last_token_indices]
+        if return_all_logits:
+            return self.lm_head(lang_model.norm(hidden_states))
+        last_hidden = lang_model.norm(self._last_token_hidden_states)
         logits = self.lm_head(last_hidden)  # [batch_size, vocab_size]
         return logits
+
+    @torch.inference_mode()
+    def forward_mtp(
+        self,
+        next_token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        mtp_cache_pool: Qwen3_8HybridCachePool,
+        forward_batch: ForwardBatch,
+        main_hidden_states: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        使用 `mtp` 预测头融合主模型隐状态与下一 Token 词嵌入，前向预测投机草稿 Token 的 Logits (`[batch_size, vocab_size]`)。
+        """
+        if self.mtp is None:
+            raise RuntimeError(
+                "当前 Qwen3_8ForCausalLM 未启用 MTP 模块 (enable_mtp=False)！"
+            )
+        if main_hidden_states is None:
+            if next_token_ids.shape[0] == forward_batch.batch_size:
+                main_hidden_states = self._last_token_hidden_states
+            else:
+                main_hidden_states = self._last_hidden_states
+        assert main_hidden_states is not None, "缺少主模型前向隐状态 main_hidden_states！"
+
+        next_token_embeds = self.model.language_model.embed_tokens(next_token_ids)
+        mtp_hidden = self.mtp(
+            main_hidden_states=main_hidden_states,
+            next_token_embeds=next_token_embeds,
+            positions=positions,
+            mtp_cache_pool=mtp_cache_pool,
+            forward_batch=forward_batch,
+        )
+        if mtp_hidden.shape[0] > forward_batch.batch_size:
+            ext_lens_t = (
+                forward_batch.extend_lens_tensor
+                if forward_batch.extend_lens_tensor is not None
+                else torch.tensor(
+                    forward_batch.extend_lens,
+                    dtype=torch.long,
+                    device=next_token_ids.device,
+                )
+            )
+            last_token_indices = torch.cumsum(ext_lens_t, dim=0) - 1
+            mtp_hidden = mtp_hidden[last_token_indices]
+        return self.lm_head(mtp_hidden)

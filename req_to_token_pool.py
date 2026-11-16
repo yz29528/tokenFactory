@@ -16,15 +16,21 @@ class ReqToTokenPool:
         ]
         # 记录空闲的 request 行号
         self.free_req_slots: List[int] = list(range(max_reqs - 1, -1, -1))
+        # 记录每行被覆写后的最小脏起始位置，用于增量同步到设备端张量时防止漏刷并发去重槽位
+        self.dirty_from: List[int] = [0] * max_reqs
 
     def alloc_req(self) -> Optional[int]:
         """为一个新请求分配一行 (req_pool_idx)。"""
         if not self.free_req_slots:
             return None
-        return self.free_req_slots.pop()
+        req_idx = self.free_req_slots.pop()
+        self.dirty_from[req_idx] = 0
+        return req_idx
 
     def write(self, req_idx: int, start_pos: int, kv_slots: List[int]) -> None:
         """将分配或复用得到的物理 KV 槽位索引写入该请求对应的行中。"""
+        if kv_slots and start_pos < self.dirty_from[req_idx]:
+            self.dirty_from[req_idx] = start_pos
         for offset, slot in enumerate(kv_slots):
             self.req_to_token[req_idx][start_pos + offset] = slot
 
@@ -38,4 +44,5 @@ class ReqToTokenPool:
         因为底层 KV 槽位会移交给 RadixCache 进行缓存复用）。
         """
         self.req_to_token[req_idx] = [-1] * self.max_context_len
+        self.dirty_from[req_idx] = 0
         self.free_req_slots.append(req_idx)

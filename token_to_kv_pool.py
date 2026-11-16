@@ -8,11 +8,15 @@ class TokenToKVPool:
     同时维护 `free_slots` 空闲栈 (O(1) 分配) 与 `is_occupied` 布尔占用位图 (防止 Double-Free)。
     """
 
-    def __init__(self, max_total_num_tokens: int):
+    def __init__(self, max_total_num_tokens: int, allocate_mock_buffers: bool = True):
         self.max_total_num_tokens = max_total_num_tokens
-        # 模拟 GPU 上的 K/V 张量缓冲池，这里用字符串模拟每个物理槽位里存放的真实 KV 向量
-        self.k_buffer: List[Optional[str]] = [None] * max_total_num_tokens
-        self.v_buffer: List[Optional[str]] = [None] * max_total_num_tokens
+        # 模拟 GPU 上的 K/V 张量缓冲池（真实推理模式下由 Qwen3_8HybridCachePool 持有物理张量，可关闭以节省内存）
+        self.k_buffer: Optional[List[Optional[str]]] = (
+            [None] * max_total_num_tokens if allocate_mock_buffers else None
+        )
+        self.v_buffer: Optional[List[Optional[str]]] = (
+            [None] * max_total_num_tokens if allocate_mock_buffers else None
+        )
         # 空闲物理槽位栈（slot 0 在 SGLang 中通常保留作 padding，这里从 1 开始）
         self.free_slots: List[int] = list(range(max_total_num_tokens - 1, 0, -1))
         # 显式标记每个物理槽位当前是否被占用（0 号槽位恒为保留状态）
@@ -38,12 +42,16 @@ class TokenToKVPool:
         for s in slots:
             assert self.is_occupied[s], f"检测到 Double-Free：物理槽位 {s} 当前并未被占用！"
             self.is_occupied[s] = False
-            self.k_buffer[s] = None
-            self.v_buffer[s] = None
+            if self.k_buffer is not None:
+                self.k_buffer[s] = None
+            if self.v_buffer is not None:
+                self.v_buffer[s] = None
             self.free_slots.append(s)
 
     def set_kv_data(self, slots: List[int], tokens: List[int]) -> None:
         """模拟 Attention 算子将计算出的 K/V 向量写入物理显存槽位。"""
+        if self.k_buffer is None or self.v_buffer is None:
+            return
         for slot, token_id in zip(slots, tokens):
             self.k_buffer[slot] = f"K(tok_{token_id})"
             self.v_buffer[slot] = f"V(tok_{token_id})"

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 import torch
 
 
@@ -24,3 +24,22 @@ class ForwardBatch:
     out_cache_loc: torch.Tensor     # [num_tokens]
     req_to_token: torch.Tensor      # [max_reqs, max_context_len]
     is_prefill: bool = True
+    # 以下为 CPU 侧预计算缓存字段，避免前向传播过程中调用 .item() 触发 GPU-CPU 同步
+    max_seq_len: int = 0
+    max_extend_len: int = 0
+    extend_lens_tensor: Optional[torch.Tensor] = None
+    req_pool_indices_list: Optional[List[int]] = None
+
+    def __post_init__(self) -> None:
+        if self.max_extend_len == 0 and self.extend_lens:
+            self.max_extend_len = max(self.extend_lens)
+        if self.extend_lens_tensor is None and self.extend_lens:
+            self.extend_lens_tensor = torch.tensor(
+                self.extend_lens, dtype=torch.long, device=self.out_cache_loc.device
+            )
+        if self.max_seq_len == 0 and self.seq_lens.numel() > 0:
+            self.max_seq_len = int(self.seq_lens.max().item())
+        if self.req_pool_indices_list is None and self.req_pool_indices.numel() > 0:
+            self.req_pool_indices_list = [
+                int(x) for x in self.req_pool_indices.tolist()
+            ]

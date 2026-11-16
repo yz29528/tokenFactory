@@ -1,12 +1,12 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 @dataclass
 class TokenizedReqInput:
     """
     IPC 消息 1 (TokenizerManager -> Scheduler):
-    携带分词后的 Token ID 序列与采样控制参数。
+    携带分词后的 Token ID 序列、采样控制参数及动态新增的增量词表映射。
     """
 
     req_id: str
@@ -15,13 +15,14 @@ class TokenizedReqInput:
     max_new_tokens: int = 16
     eos_token_id: Optional[int] = None
     temperature: float = 0.0  # 0.0 表示 Greedy 贪心解码
+    vocab_updates: Dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
 class BatchTokenIDOut:
     """
     IPC 消息 2 (Scheduler -> DetokenizerManager):
-    每个 Step 结束后，将本批次中各请求新生成的 Token ID、Chunked Prefill 进度及完成状态发往后处理进程。
+    每个 Step 结束后，将本批次中各请求新生成的 Token ID、Chunked Prefill 进度、完成状态及增量词表同步发往后处理进程。
     """
 
     step_id: int
@@ -33,6 +34,9 @@ class BatchTokenIDOut:
     finished_flags: List[bool] = field(default_factory=list)
     cached_prefix_lens: List[int] = field(default_factory=list)
     chunk_progress: List[str] = field(default_factory=list)  # 例如 "chunk 4/8" 或 "decode"
+    vocab_updates: Dict[int, str] = field(default_factory=dict)
+    # 当启用 MTP 投机解码且单步验证通过多于 1 个 Token 时，记录每个请求的完整新增 Token 列表
+    multi_token_ids: Optional[List[List[int]]] = None
 
 
 @dataclass

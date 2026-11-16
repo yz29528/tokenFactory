@@ -31,14 +31,14 @@ class Qwen3_8MTPBlock(nn.Module):
         self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
         # MTP 层在 config.json 中使用 full_attention (见 mtp.layers.0.self_attn.q_norm / k_norm)
-        mtp_cfg = replace(
+        self.mtp_config = replace(
             config,
             num_hidden_layers=config.mtp_num_hidden_layers,
             layer_types=["full_attention"] * config.mtp_num_hidden_layers,
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3_8DecoderLayer(mtp_cfg, i)
+                Qwen3_8DecoderLayer(self.mtp_config, i)
                 for i in range(config.mtp_num_hidden_layers)
             ]
         )
@@ -57,9 +57,14 @@ class Qwen3_8MTPBlock(nn.Module):
         normed_hid = self.pre_fc_norm_hidden(main_hidden_states)
         hidden_states = self.fc(torch.cat([normed_emb, normed_hid], dim=-1))
 
+        active_mtp_pool = (
+            mtp_cache_pool
+            if 0 in mtp_cache_pool.full_layer_map
+            else mtp_cache_pool.get_mtp_cache_pool()
+        )
         for layer in self.layers:
             hidden_states = layer(
-                hidden_states, positions, mtp_cache_pool, forward_batch
+                hidden_states, positions, active_mtp_pool, forward_batch
             )
 
         return self.norm(hidden_states)
